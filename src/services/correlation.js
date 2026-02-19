@@ -63,26 +63,55 @@ export async function handleNewTicket(ticket, freshdesk, bot, authorizedChats) {
     else if (isUpState(subject)) {
       logger.info(`UP state detected for ticket #${ticketId}`);
       
-      // Find all DOWN tickets with this correlation key
-      const downTickets = await database.getDownTickets(correlationKey);
+      // Find DOWN tickets from TWO sources:
+      // 1. From database (DOWN tickets created after system started)
+      // 2. From Freshdesk search (handles pre-existing DOWN tickets)
       
-      if (downTickets.length === 0) {
+      const downTicketsFromDb = await database.getDownTickets(correlationKey);
+      logger.info(`Found ${downTicketsFromDb.length} DOWN ticket(s) from database`);
+
+      // Search Freshdesk for all DOWN tickets with matching key
+      let downTicketsFromFreshdesk = [];
+      try {
+        const ticketsRes = await freshdesk.client.get('/tickets', { params: { per_page: 100 } });
+        const allTickets = Array.isArray(ticketsRes.data) ? ticketsRes.data : (ticketsRes.data.tickets || []);
+        
+        // Find DOWN tickets with matching correlation key that are still open
+        downTicketsFromFreshdesk = allTickets.filter(t => {
+          const tCorrelationKey = extractCorrelationKey(t.subject);
+          const isDown = isDownState(t.subject);
+          const isOpen = t.status !== 5 && t.status !== 4; // Not closed or resolved
+          return tCorrelationKey === correlationKey && isDown && isOpen;
+        });
+        
+        logger.info(`Found ${downTicketsFromFreshdesk.length} DOWN ticket(s) from Freshdesk search`);
+      } catch (err) {
+        logger.error(`Error searching Freshdesk for DOWN tickets:`, err.message);
+      }
+
+      // Merge and deduplicate
+      const ticketIdsToClose = new Set();
+      
+      downTicketsFromDb.forEach(dt => ticketIdsToClose.add(dt.ticket_id));
+      downTicketsFromFreshdesk.forEach(t => ticketIdsToClose.add(t.id));
+
+      if (ticketIdsToClose.size === 0) {
         logger.info(`No DOWN tickets found for correlation key: "${correlationKey}"`);
         return;
       }
 
-      logger.info(`Found ${downTickets.length} DOWN ticket(s) to close`);
+      logger.info(`Found ${ticketIdsToClose.size} total DOWN ticket(s) to close`);
 
       // Close all DOWN tickets with reason
       const closedTicketIds = [];
-      for (const downTicket of downTickets) {
+      for (const downTicketId of ticketIdsToClose) {
         try {
           const reason = `Service is UP - Closed by automatic correlation with ticket #${ticketId}`;
-          await freshdesk.closeTicket(downTicket.ticket_id, reason);
-          logger.info(`Closed DOWN ticket #${downTicket.ticket_id}`);
-          closedTicketIds.push(downTicket.ticket_id);
+          await freshdesk.closeTicket(downTicketId, reason);
+          logger.info(`Closed DOWN ticket #${downTicketId}`);
+          closedTicketIds.push(downTicketId);
         } catch (err) {
-          logger.error(`Failed to close DOWN ticket #${downTicket.ticket_id}:`, err.message);
+          logger.error(`Failed to close DOWN ticket #${downTicketId}:`, err.message);
         }
       }
 

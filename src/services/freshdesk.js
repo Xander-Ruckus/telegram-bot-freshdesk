@@ -290,9 +290,11 @@ export class Freshdesk {
    */
   async addTicketReply(ticketId, reply) {
     try {
-      const response = await this.client.post(`/tickets/${ticketId}/conversations`, {
+      // Try using notes endpoint as fallback for closure comments
+      // This adds an internal note (private comment) to the ticket
+      const response = await this.client.post(`/tickets/${ticketId}/notes`, {
         body: reply,
-        body_html: `<p>${reply}</p>`,
+        private: false, // Set to false for agent replies
       });
       
       logger.info(`Reply added to ticket ${ticketId}`);
