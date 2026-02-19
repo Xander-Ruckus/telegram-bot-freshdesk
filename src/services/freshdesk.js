@@ -320,6 +320,23 @@ export class Freshdesk {
     }
   }
 
+  /**
+   * Close ticket (sets status to closed = 5)
+   */
+  async closeTicket(ticketId, note = null) {
+    try {
+      const response = await this.client.put(`/tickets/${ticketId}`, {
+        status: 5, // 5 = Closed
+      });
+      
+      logger.info(`Ticket ${ticketId} closed`);
+      return response.data;
+    } catch (error) {
+      logger.error(`Error closing ticket ${ticketId}:`, error.message);
+      throw error;
+    }
+  }
+
   // ============ UTILITY METHODS ============
 
   _formatStatus(status) {

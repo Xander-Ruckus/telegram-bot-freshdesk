@@ -7,6 +7,7 @@ import { dirname } from 'path';
 import { Freshdesk } from './services/freshdesk.js';
 import { setupWebhooks } from './webhooks/index.js';
 import { logger } from './utils/logger.js';
+import { initializeDatabase } from './services/database.js';
 
 dotenv.config();
 
@@ -469,36 +470,46 @@ process.on('unhandledRejection', (reason, promise) => {
   logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
-// ============ WEBHOOK SETUP ============
+// ============ INITIALIZATION ============
 
-setupWebhooks(app, bot, freshdesk, userSettings, logger, authorizedChats);
+async function startBot() {
+  try {
+    // Initialize database for ticket correlation
+    logger.info('Initializing database...');
+    await initializeDatabase();
+    logger.info('✅ Database initialized');
 
-// ============ SERVER START ============
+    // Setup webhooks
+    setupWebhooks(app, bot, freshdesk, userSettings, logger, authorizedChats);
 
-const server = app.listen(webhookPort, () => {
-  logger.info(`✅ Webhook server running on port ${webhookPort}`);
-  logger.info(`✅ Telegram bot @${process.env.TELEGRAM_BOT_USERNAME} started`);
-});
+    // Start server
+    const server = app.listen(webhookPort, () => {
+      logger.info(`✅ Webhook server running on port ${webhookPort}`);
+      logger.info(`✅ Telegram bot @${process.env.TELEGRAM_BOT_USERNAME} started`);
+    });
 
-// Launch bot
-bot.launch().then(() => {
-  logger.info('🤖 Bot successfully launched');
-}).catch((err) => {
-  logger.error('Failed to launch bot:', err);
-  process.exit(1);
-});
+    // Launch bot
+    await bot.launch();
+    logger.info('🤖 Bot successfully launched');
 
-// Graceful shutdown
-process.once('SIGINT', () => {
-  logger.info('SIGINT received, shutting down...');
-  server.close();
-  bot.stop('SIGINT');
-});
+    // Graceful shutdown
+    process.once('SIGINT', () => {
+      logger.info('SIGINT received, shutting down...');
+      server.close();
+      bot.stop('SIGINT');
+    });
 
-process.once('SIGTERM', () => {
-  logger.info('SIGTERM received, shutting down...');
-  server.close();
-  bot.stop('SIGTERM');
-});
+    process.once('SIGTERM', () => {
+      logger.info('SIGTERM received, shutting down...');
+      server.close();
+      bot.stop('SIGTERM');
+    });
+  } catch (err) {
+    logger.error('Failed to start bot:', err);
+    process.exit(1);
+  }
+}
+
+startBot();
 
 export { bot, freshdesk, app };
