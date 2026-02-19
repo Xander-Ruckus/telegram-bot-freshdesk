@@ -1,0 +1,32 @@
+[Unit]
+Description=Telegram Freshdesk Bot Service
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=telegram-bot
+WorkingDirectory=/opt/telegram-bot-freshdesk
+ExecStart=/usr/bin/node src/bot.js
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/telegram-bot-freshdesk/bot.log
+StandardError=append:/var/log/telegram-bot-freshdesk/error.log
+Environment="NODE_ENV=production"
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+EnvironmentFile=/opt/telegram-bot-freshdesk/.env
+SyslogIdentifier=telegram-bot
+
+# Security and resource limits
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/telegram-bot-freshdesk /var/log/telegram-bot-freshdesk
+
+# Restart policy
+StartLimitInterval=3600
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target
