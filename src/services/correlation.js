@@ -73,11 +73,12 @@ export async function handleNewTicket(ticket, freshdesk, bot, authorizedChats) {
 
       logger.info(`Found ${downTickets.length} DOWN ticket(s) to close`);
 
-      // Close all DOWN tickets
+      // Close all DOWN tickets with reason
       const closedTicketIds = [];
       for (const downTicket of downTickets) {
         try {
-          await freshdesk.closeTicket(downTicket.ticket_id);
+          const reason = `Service is UP - Closed by automatic correlation with ticket #${ticketId}`;
+          await freshdesk.closeTicket(downTicket.ticket_id, reason);
           logger.info(`Closed DOWN ticket #${downTicket.ticket_id}`);
           closedTicketIds.push(downTicket.ticket_id);
         } catch (err) {

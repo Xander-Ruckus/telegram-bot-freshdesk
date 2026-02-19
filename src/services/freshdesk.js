@@ -321,15 +321,28 @@ export class Freshdesk {
   }
 
   /**
-   * Close ticket (sets status to closed = 5)
+   * Close ticket (sets status to closed = 5) with optional comment
    */
-  async closeTicket(ticketId, note = null) {
+  async closeTicket(ticketId, reason = null) {
     try {
+      // Close the ticket
       const response = await this.client.put(`/tickets/${ticketId}`, {
         status: 5, // 5 = Closed
       });
       
-      logger.info(`Ticket ${ticketId} closed`);
+      // Add a comment with closure details
+      if (reason) {
+        const timestamp = new Date().toISOString();
+        const comment = `[AUTOMATED] Ticket closed at ${timestamp}\nReason: ${reason}`;
+        
+        try {
+          await this.addTicketReply(ticketId, comment);
+        } catch (err) {
+          logger.warn(`Could not add closure comment to ticket ${ticketId}:`, err.message);
+        }
+      }
+      
+      logger.info(`Ticket ${ticketId} closed${reason ? ` - Reason: ${reason}` : ''}`);
       return response.data;
     } catch (error) {
       logger.error(`Error closing ticket ${ticketId}:`, error.message);
