@@ -63,11 +63,131 @@ export class Freshdesk {
   }
 
   /**
+   * Get ALL tickets with pagination (no limit)
+   */
+  async getAllTickets() {
+    try {
+      let allTickets = [];
+      let page = 1;
+      let hasMore = true;
+      const perPage = 100; // Maximum per Freshdesk API is 100
+
+      logger.info('Fetching all tickets with pagination...');
+
+      while (hasMore) {
+        const response = await this.client.get('/tickets', {
+          params: {
+            page: page,
+            per_page: perPage,
+            order_by: 'created_at',
+            order_type: 'desc',
+          },
+        });
+
+        // Handle both response formats
+        const tickets = Array.isArray(response.data) ? response.data : (response.data.tickets || []);
+        
+        if (tickets.length === 0) {
+          hasMore = false;
+          break;
+        }
+
+        // Map tickets to our format
+        const mappedTickets = tickets.map(ticket => ({
+          id: ticket.id,
+          subject: ticket.subject,
+          status: this._formatStatus(ticket.status),
+          priority: this._formatPriority(ticket.priority),
+          created_at: ticket.created_at,
+          customer_name: ticket.requester_id,
+        }));
+
+        allTickets = allTickets.concat(mappedTickets);
+        logger.info(`Fetched ${tickets.length} tickets from page ${page}. Total so far: ${allTickets.length}`);
+
+        // Check if there are more pages
+        if (tickets.length < perPage) {
+          hasMore = false;
+        } else {
+          page++;
+        }
+      }
+
+      logger.info(`Successfully fetched all ${allTickets.length} tickets`);
+      return allTickets;
+    } catch (error) {
+      logger.error('Error fetching all tickets:', error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Get only open tickets (not Closed or Resolved) with pagination
+   */
+  async getOpenTickets() {
+    try {
+      let allTickets = [];
+      let page = 1;
+      let hasMore = true;
+      const perPage = 100;
+
+      logger.info('Fetching open tickets with pagination...');
+
+      while (hasMore) {
+        const response = await this.client.get('/tickets', {
+          params: {
+            page: page,
+            per_page: perPage,
+            order_by: 'created_at',
+            order_type: 'desc',
+          },
+        });
+
+        const tickets = Array.isArray(response.data) ? response.data : (response.data.tickets || []);
+
+        if (tickets.length === 0) {
+          hasMore = false;
+          break;
+        }
+
+        // Filter out Closed (5) and Resolved (4) at source
+        const openOnly = tickets.filter(t => t.status !== 5 && t.status !== 4);
+
+        const mappedTickets = openOnly.map(ticket => ({
+          id: ticket.id,
+          subject: ticket.subject,
+          status: this._formatStatus(ticket.status),
+          priority: this._formatPriority(ticket.priority),
+          created_at: ticket.created_at,
+          customer_name: ticket.requester_id,
+        }));
+
+        allTickets = allTickets.concat(mappedTickets);
+        logger.info(`Fetched ${openOnly.length} open tickets from page ${page}. Total so far: ${allTickets.length}`);
+
+        if (tickets.length < perPage) {
+          hasMore = false;
+        } else {
+          page++;
+        }
+      }
+
+      logger.info(`Successfully fetched ${allTickets.length} open tickets`);
+      return allTickets;
+    } catch (error) {
+      logger.error('Error fetching open tickets:', error.message);
+      throw error;
+    }
+  }
+
+  /**
    * Get ticket by ID
    */
   async getTicket(ticketId) {
     try {
-      const response = await this.client.get(`/tickets/${ticketId}`);
+      const response = await this.client.get(`/tickets/${ticketId}`, {
+        params: { include: 'requester,conversations' },
+      });
       // Handle both response formats (direct object or wrapped in ticket property)
       const ticket = response.data?.ticket || response.data;
       
@@ -75,6 +195,8 @@ export class Freshdesk {
         logger.error(`Invalid ticket response for ${ticketId}:`, response.data);
         throw new Error(`Invalid ticket response - ticket data not found`);
       }
+
+      const requester = ticket.requester || {};
       
       return {
         id: ticket.id,
@@ -82,14 +204,36 @@ export class Freshdesk {
         description: ticket.description_text || ticket.description || '',
         status: this._formatStatus(ticket.status),
         priority: this._formatPriority(ticket.priority),
+        type: ticket.type || 'N/A',
+        source: this._formatSource(ticket.source),
+        tags: ticket.tags || [],
         created_at: ticket.created_at,
         updated_at: ticket.updated_at,
-        customer_email: ticket.custom_fields?.email || ticket.email || 'N/A',
+        due_by: ticket.due_by,
+        fr_due_by: ticket.fr_due_by,
+        requester_name: requester.name || 'N/A',
+        requester_email: requester.email || ticket.custom_fields?.email || ticket.email || 'N/A',
+        requester_phone: requester.phone || requester.mobile || 'N/A',
+        responder_id: ticket.responder_id,
+        group_id: ticket.group_id,
+        conversations: (ticket.conversations || []).map(conv => ({
+          id: conv.id,
+          body: conv.body_text || '',
+          user_id: conv.user_id,
+          created_at: conv.created_at,
+          private: conv.private,
+          from_email: conv.from_email || '',
+        })),
       };
     } catch (error) {
       logger.error(`Error fetching ticket ${ticketId}:`, error.message);
       throw error;
     }
+  }
+
+  _formatSource(source) {
+    const sources = { 1: 'Email', 2: 'Portal', 3: 'Phone', 4: 'Forum', 5: 'Twitter', 6: 'Facebook', 7: 'Chat', 8: 'Feedback Widget', 9: 'Outbound Email', 10: 'API' };
+    return sources[source] || `Unknown (${source})`;
   }
 
   /**
@@ -101,13 +245,13 @@ export class Freshdesk {
         params: { per_page: 100 },
       });
       
-      // Handle both response formats (array or object with agents property)
+      // Agents comes as a direct array from the API
       const agents = Array.isArray(response.data) ? response.data : (response.data.agents || []);
       
       return agents.map(agent => ({
         id: agent.id,
-        name: agent.name,
-        email: agent.email,
+        name: agent.contact?.name || agent.name || 'Unknown Agent',
+        email: agent.contact?.email || agent.email || 'N/A',
         available: agent.available,
         ticket_scope: agent.ticket_scope,
       }));
@@ -206,6 +350,87 @@ export class Freshdesk {
     } catch (error) {
       logger.error('Error fetching ticket metrics:', error.message);
       throw error;
+    }
+  }
+
+  /**
+   * Merge related tickets (Down -> Up status changes)
+   * Closes the old "Down" ticket and adds a link to the new "Up" ticket
+   */
+  async mergeRelatedTickets(newTicketId, newTicketSubject) {
+    try {
+      // Extract device name from subject
+      // Format: "DEVICE-NAME (IP) : STATE - Up/Down"
+      const deviceMatch = newTicketSubject.match(/^(.+?)\s*:\s*STATE\s*-\s*(Up|Down)$/i);
+      
+      if (!deviceMatch) {
+        logger.debug(`Ticket ${newTicketId} doesn't match device pattern, skipping merge`);
+        return null;
+      }
+
+      const deviceName = deviceMatch[1].trim();
+      const currentStatus = deviceMatch[2].toLowerCase();
+      const oppositeStatus = currentStatus === 'up' ? 'down' : 'up';
+
+      logger.info(`Checking for merge: Device "${deviceName}" now ${currentStatus}, looking for ${oppositeStatus} ticket...`);
+
+      // Search for all open/pending tickets with the same device name but opposite status
+      const allTickets = await this.getAllTickets();
+      
+      const relatedTickets = allTickets.filter(t => {
+        const ticketMatch = t.subject.match(/^(.+?)\s*:\s*STATE\s*-\s*(Up|Down)$/i);
+        if (!ticketMatch) return false;
+        
+        const ticketDevice = ticketMatch[1].trim();
+        const ticketStatus = ticketMatch[2].toLowerCase();
+        
+        return ticketDevice === deviceName && 
+               ticketStatus === oppositeStatus &&
+               t.id !== newTicketId &&
+               t.status !== 'Closed' &&
+               t.status !== 'Resolved';
+      });
+
+      if (relatedTickets.length === 0) {
+        logger.info(`No related ${oppositeStatus} ticket found for device "${deviceName}"`);
+        return null;
+      }
+
+      // Get the most recent related ticket
+      const oldTicket = relatedTickets.sort((a, b) => 
+        new Date(b.created_at) - new Date(a.created_at)
+      )[0];
+
+      logger.info(`Found related ticket #${oldTicket.id} (${oldTicket.status}). Merging with #${newTicketId}...`);
+
+      // Close the old ticket
+      await this.updateTicketStatus(oldTicket.id, 'closed');
+      
+      // Add note to new ticket linking to old ticket
+      const mergeNote = `🔗 MERGED: This ticket (#${newTicketId}) includes the resolution of ticket #${oldTicket.id}\n` +
+                        `Previous Status: ${oldTicket.subject}\n` +
+                        `Resolution: Device returned to UP status`;
+      
+      await this.addTicketNote(newTicketId, mergeNote, true);
+
+      // Add note to old ticket linking to new ticket
+      const oldTicketNote = `🔗 MERGED: Ticket #${newTicketId} has been created after device returned to UP status.\n` +
+                             `This ticket (#${oldTicket.id}) has been closed as the issue is now resolved.`;
+      
+      await this.addTicketNote(oldTicket.id, oldTicketNote, true);
+
+      logger.info(`✅ Successfully merged ticket #${oldTicket.id} with #${newTicketId}`);
+
+      return {
+        mergedTicketId: oldTicket.id,
+        newTicketId: newTicketId,
+        deviceName: deviceName,
+        previousStatus: oldTicket.status
+      };
+    } catch (error) {
+      logger.error(`Error merging related tickets for #${newTicketId}:`, error.message);
+      // Don't throw - merging is a nice-to-have feature
+      return null;
     }
   }
 
@@ -348,6 +573,24 @@ export class Freshdesk {
       return response.data;
     } catch (error) {
       logger.error(`Error closing ticket ${ticketId}:`, error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Close ticket and assign to agent in one operation
+   */
+  async closeAndAssignTicket(ticketId, agentId) {
+    try {
+      const response = await this.client.put(`/tickets/${ticketId}`, {
+        status: 5, // Closed status
+        responder_id: agentId,
+      });
+      
+      logger.info(`Ticket ${ticketId} closed and assigned to agent ${agentId}`);
+      return response.data;
+    } catch (error) {
+      logger.error(`Error closing and assigning ticket ${ticketId}:`, error.message);
       throw error;
     }
   }

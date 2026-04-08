@@ -71,7 +71,14 @@ async function handleTicketCreated(event, bot, freshdesk, userSettings, loggerIn
     const ticket = await freshdesk.getTicket(ticketId);
 
     // Handle ticket correlation (DOWN/UP state matching)
-    await correlation.handleNewTicket(ticket, freshdesk, bot, authorizedChats);
+    const correlationResult = await correlation.handleNewTicket(ticket, freshdesk, bot, authorizedChats);
+
+    let mergeNotification = '';
+    if (correlationResult?.state === 'up' && correlationResult.closedTicketIds.length > 0) {
+      const closedList = correlationResult.closedTicketIds.map(id => `#${id}`).join(', ');
+      mergeNotification = `\n🔗 AUTO-CORRELATED: Closed related DOWN ticket(s) ${closedList}`;
+      logger.info(`Auto-correlated UP ticket #${ticketId} with DOWN ticket(s): ${closedList}`);
+    }
 
     const message = `
 📌 New Ticket Created
@@ -80,7 +87,7 @@ async function handleTicketCreated(event, bot, freshdesk, userSettings, loggerIn
 Priority: ${getPriorityEmoji(ticket.priority)} ${ticket.priority}
 Status: ${ticket.status}
 Customer: ${ticket.customer_email}
-Created: ${new Date(ticket.created_at).toLocaleString()}
+Created: ${new Date(ticket.created_at).toLocaleString()}${mergeNotification}
     `;
 
     await broadcastToUsers(bot, message, userSettings, authorizedChats, loggerInstance);

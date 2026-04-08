@@ -2,17 +2,14 @@ import { Telegraf, Markup } from 'telegraf';
 import express from 'express';
 import bodyParser from 'body-parser';
 import dotenv from 'dotenv';
-import { fileURLToPath } from 'url';
-import { dirname } from 'path';
+import path from 'path';
 import { Freshdesk } from './services/freshdesk.js';
 import { setupWebhooks } from './webhooks/index.js';
 import { logger } from './utils/logger.js';
 import { initializeDatabase } from './services/database.js';
+import { reconcileOpenTickets, broadcastToUsers } from './services/correlation.js';
 
 dotenv.config();
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
 
 // Initialize bot
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
@@ -29,6 +26,17 @@ const webhookPort = process.env.WEBHOOK_PORT || 3000;
 
 app.use(bodyParser.json());
 
+// Priority to color emoji mapping
+function priorityEmoji(priority) {
+  switch ((priority || '').toLowerCase()) {
+    case 'low': return '🟢';
+    case 'medium': return '🟡';
+    case 'high': return '🟠';
+    case 'urgent': return '🔴';
+    default: return '⚪';
+  }
+}
+
 // Store user settings (in production, use a database)
 const userSettings = new Map();
 
@@ -37,6 +45,15 @@ const userCurrentTicket = new Map();
 
 // Store authorized chat IDs for broadcasting (persistent across sessions)
 const authorizedChats = new Set();
+
+// Store search results for users (for bulk operations)
+const userSearchResults = new Map();
+
+// Store selected tickets for users (for bulk closing)
+const userSelectedTickets = new Map();
+
+// Store pending close operations awaiting agent selection
+const userPendingCloseOps = new Map();
 
 // ============ BOT COMMANDS ============
 
@@ -85,6 +102,8 @@ bot.command('help', async (ctx) => {
 /status - Check bot and Freshdesk status
 /tickets - Get all tickets
 /open - Show only OPEN/PENDING tickets
+/search <keyword> - Find open tickets by keyword
+/closeall "<keyword>" - Close all tickets matching keyword
 /agents - List active agents
 /test - Send test notification
 
@@ -98,6 +117,11 @@ Update by replying with:
   priority high      (low/medium/high/urgent)
   note Your text     (add private note)
   comment Message    (add public comment)
+
+🔄 BULK OPERATIONS:
+
+/search "outage"       → Find all open tickets with "outage"
+/closeall "outage"     → Close all tickets matching "outage"
 
 🔔 Notifications:
 Receive automatic updates about:
@@ -154,38 +178,45 @@ To modify settings, contact your administrator.
 
 bot.command('tickets', async (ctx) => {
   try {
-    await ctx.reply('⏳ Fetching all tickets (this may take a moment)...');
+    await ctx.reply('⏳ Fetching open tickets...');
     
-    // Fetch many tickets to ensure we get them all
-    const allTickets = await freshdesk.getRecentTickets(100);
+    // Fetch only open tickets
+    const openTickets = await freshdesk.getOpenTickets();
     
-    // Filter by status - show Open, Pending, On Hold tickets
-    const openTickets = allTickets.filter(t => 
-      t.status.toLowerCase() !== 'closed' && 
-      t.status.toLowerCase() !== 'resolved'
-    );
-    
-    if (allTickets.length === 0) {
-      await ctx.reply('No tickets found.');
+    if (openTickets.length === 0) {
+      await ctx.reply('✅ No open tickets found.');
       return;
     }
 
-    let ticketsMessage = `📋 All Tickets (Total: ${allTickets.length})\n`;
-    ticketsMessage += `Open: ${openTickets.length} | `;
+    // Send summary first
+    let summary = `📋 Open Tickets: ${openTickets.length}\n`;
+    await ctx.reply(summary);
     
-    const closedCount = allTickets.length - openTickets.length;
-    ticketsMessage += `Closed: ${closedCount}\n\n`;
+    // Split messages to respect Telegram's 4096 char limit
+    const messages = [];
+    let currentMessage = `<b>Open Tickets:</b>\n\n`;
+    const messageLimit = 3800;
     
-    // Show all tickets
-    ticketsMessage += `<b>All Tickets:</b>\n\n`;
-    allTickets.forEach((ticket, index) => {
-      const statusEmoji = ticket.status.toLowerCase().includes('open') || 
-                         ticket.status.toLowerCase().includes('pending') ? '🔴' : '✅';
-      ticketsMessage += `${statusEmoji} #${ticket.id} - ${ticket.subject.substring(0, 40)}${ticket.subject.length > 40 ? '...' : ''}\n`;
-      ticketsMessage += `   Status: ${ticket.status} | Priority: ${ticket.priority}\n`;
+    openTickets.forEach((ticket, index) => {
+      const truncatedSubject = ticket.subject.substring(0, 50) + (ticket.subject.length > 50 ? '...' : '');
+      const pe = priorityEmoji(ticket.priority);
+      const ticketLine = `${pe} #${ticket.id} - ${truncatedSubject}\n   Status: ${ticket.status} | Priority: ${ticket.priority}\n`;
+      
+      if ((currentMessage + ticketLine).length > messageLimit && currentMessage !== `<b>Open Tickets:</b>\n\n`) {
+        messages.push(currentMessage);
+        currentMessage = `--- Continued ---\n\n${ticketLine}`;
+      } else {
+        currentMessage += ticketLine;
+      }
     });
-
-    await ctx.reply(ticketsMessage, { parse_mode: 'HTML' });
+    
+    if (currentMessage.length > 0) {
+      messages.push(currentMessage);
+    }
+    
+    for (const msg of messages) {
+      await ctx.reply(msg, { parse_mode: 'HTML' });
+    }
   } catch (error) {
     logger.error('Tickets fetch error:', error);
     await ctx.reply('❌ Error fetching tickets. Please try again later.');
@@ -196,27 +227,40 @@ bot.command('open', async (ctx) => {
   try {
     await ctx.reply('⏳ Fetching open tickets...');
     
-    const allTickets = await freshdesk.getRecentTickets(50);
-    
-    // Filter for open/pending tickets only
-    const openTickets = allTickets.filter(t => 
-      t.status.toLowerCase() !== 'closed' && 
-      t.status.toLowerCase() !== 'resolved'
-    );
+    const openTickets = await freshdesk.getOpenTickets();
     
     if (openTickets.length === 0) {
       await ctx.reply('✅ No open tickets! All tickets are resolved.');
       return;
     }
 
-    let message = `🔴 OPEN TICKETS (${openTickets.length} total)\n\n`;
+    // Split message to respect Telegram's 4096 char limit
+    const messages = [];
+    let currentMessage = `🔴 OPEN TICKETS (${openTickets.length} total)\n\n`;
+    const messageLimit = 3800; // Leave room for safety
     
     openTickets.forEach((ticket, index) => {
-      message += `${index + 1}. #${ticket.id} - ${ticket.subject}\n`;
-      message += `   Status: ${ticket.status} | Priority: ${ticket.priority}\n`;
+      const pe = priorityEmoji(ticket.priority);
+      const ticketLine = `${pe} ${index + 1}. #${ticket.id} - ${ticket.subject.substring(0, 50)}${ticket.subject.length > 50 ? '...' : ''}\n   Status: ${ticket.status} | Priority: ${ticket.priority}\n`;
+      
+      // If adding this ticket would exceed limit, push current message and start new one
+      if ((currentMessage + ticketLine).length > messageLimit && currentMessage !== `🔴 OPEN TICKETS (${openTickets.length} total)\n\n`) {
+        messages.push(currentMessage);
+        currentMessage = `--- Continued ---\n\n${ticketLine}`;
+      } else {
+        currentMessage += ticketLine;
+      }
     });
-
-    await ctx.reply(message);
+    
+    // Push the last message
+    if (currentMessage.length > 0) {
+      messages.push(currentMessage);
+    }
+    
+    // Send all messages
+    for (const msg of messages) {
+      await ctx.reply(msg);
+    }
   } catch (error) {
     logger.error('Open tickets fetch error:', error);
     await ctx.reply('❌ Error fetching open tickets. Please try again later.');
@@ -247,16 +291,16 @@ Next step: Create a ticket in Freshdesk to test webhook integration.
 
 bot.command('debug', async (ctx) => {
   try {
-    await ctx.reply('🔍 Checking Freshdesk connection and available tickets...');
+    await ctx.reply('🔍 Checking Freshdesk connection and open tickets...');
     
-    const allTickets = await freshdesk.getRecentTickets(100);
+    const allTickets = await freshdesk.getOpenTickets();
     
     if (allTickets.length === 0) {
-      await ctx.reply('⚠️ No tickets found in Freshdesk.');
+      await ctx.reply('⚠️ No open tickets found in Freshdesk.');
       return;
     }
     
-    let debugMessage = `✅ Found ${allTickets.length} tickets\n\n`;
+    let debugMessage = `✅ Found ${allTickets.length} open tickets\n\n`;
     debugMessage += `First 10 ticket IDs:\n`;
     
     allTickets.slice(0, 10).forEach((t, i) => {
@@ -287,14 +331,308 @@ bot.command('agents', async (ctx) => {
     
     agents.forEach((agent, index) => {
       agentsMessage += `${index + 1}. ${agent.name}\n`;
-      agentsMessage += `   Email: ${agent.email}\n`;
-      agentsMessage += `   Status: ${agent.available ? '🟢 Available' : '🔴 Busy'}\n\n`;
+      agentsMessage += `   Email: ${agent.email}\n\n`;
     });
 
     await ctx.reply(agentsMessage);
   } catch (error) {
     logger.error('Agents fetch error:', error);
     await ctx.reply('❌ Error fetching agents. Please try again later.');
+  }
+});
+
+bot.command('search', async (ctx) => {
+  try {
+    const userId = ctx.from.id;
+    const keyword = ctx.message.text.split('/search ')[1]?.trim();
+    
+    if (!keyword) {
+      await ctx.reply('📌 Usage: /search <keyword>\n\nExample: /search "network outage"');
+      return;
+    }
+    
+    await ctx.reply(`🔍 Searching for open tickets with keyword: "${keyword}"...`);
+    
+    const allTickets = await freshdesk.getOpenTickets();
+    
+    // Filter for tickets matching the keyword (case-insensitive)
+    const matchingTickets = allTickets.filter(t => {
+      return t.subject.toLowerCase().includes(keyword.toLowerCase());
+    });
+    
+    if (matchingTickets.length === 0) {
+      await ctx.reply(`❌ No open tickets found matching "${keyword}". Try a different keyword.`);
+      userSearchResults.delete(userId);
+      return;
+    }
+    
+    // Store results for bulk operations
+    userSearchResults.set(userId, {
+      keyword: keyword,
+      tickets: matchingTickets,
+      timestamp: Date.now()
+    });
+    
+    // Send results in chunks to avoid message size limits
+    let message = `🎯 Found ${matchingTickets.length} open ticket(s) matching "${keyword}":\n\n`;
+    const messageLimit = 3800;
+    const messages = [];
+    
+    matchingTickets.forEach((ticket, index) => {
+      const pe = priorityEmoji(ticket.priority);
+      const ticketLine = `${pe} ${index + 1}. #${ticket.id} - ${ticket.subject.substring(0, 50)}${ticket.subject.length > 50 ? '...' : ''}\n   Status: ${ticket.status} | Priority: ${ticket.priority}\n`;
+      
+      if ((message + ticketLine).length > messageLimit && message !== `🎯 Found ${matchingTickets.length} open ticket(s) matching "${keyword}":\n\n`) {
+        messages.push(message);
+        message = `--- Continued ---\n\n${ticketLine}`;
+      } else {
+        message += ticketLine;
+      }
+    });
+    
+    if (message.length > 0) {
+      messages.push(message);
+    }
+    
+    for (const msg of messages) {
+      await ctx.reply(msg);
+    }
+    
+    // Send options
+    await ctx.reply(
+      `📋 Options:\n/closeall "${keyword}" - Close all ${matchingTickets.length} tickets\n/details <ticket_id> - View specific ticket details`,
+      Markup.keyboard([
+        [`/closeall "${keyword}"`],
+        ['/search', '/open'],
+      ]).resize()
+    );
+    
+    logger.info(`User ${userId} searched for tickets with keyword: "${keyword}" (found ${matchingTickets.length})`);
+  } catch (error) {
+    logger.error('Search error:', error);
+    await ctx.reply('❌ Error searching tickets. Please try again later.');
+  }
+});
+
+bot.command('closeall', async (ctx) => {
+  try {
+    const userId = ctx.from.id;
+    const keyword = ctx.message.text.split('/closeall ')[1]?.trim().replace(/"/g, '');
+    
+    if (!keyword) {
+      await ctx.reply('📌 Usage: /closeall "<keyword>"\n\nExample: /closeall "network outage"');
+      return;
+    }
+    
+    const searchResults = userSearchResults.get(userId);
+    
+    if (!searchResults || searchResults.keyword !== keyword) {
+      await ctx.reply(`⚠️ No search results found for "${keyword}". Please run /search "<keyword>" first.`);
+      return;
+    }
+    
+    const ticketsToClose = searchResults.tickets;
+    
+    if (ticketsToClose.length === 0) {
+      await ctx.reply('❌ No tickets to close.');
+      return;
+    }
+    
+    // Confirmation message
+    await ctx.reply(
+      `⚠️ About to close ${ticketsToClose.length} ticket(s):\n\n${ticketsToClose.map(t => `#${t.id}: ${t.subject.substring(0, 40)}`).join('\n')}\n\nClick "Confirm Close All" to proceed or "Cancel" to abort.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback('✅ Confirm Close All', `closeall_confirm_${userId}`)],
+        [Markup.button.callback('❌ Cancel', `closeall_cancel_${userId}`)],
+      ])
+    );
+    
+    logger.info(`User ${userId} initiated bulk close for ${ticketsToClose.length} tickets`);
+  } catch (error) {
+    logger.error('Closeall command error:', error);
+    await ctx.reply('❌ Error closing tickets. Please try again later.');
+  }
+});
+
+// Handle confirmation callbacks
+bot.action(/closeall_confirm_(\d+)/, async (ctx) => {
+  try {
+    const userId = parseInt(ctx.match[1]);
+    const searchResults = userSearchResults.get(userId);
+    
+    if (!searchResults) {
+      await ctx.answerCbQuery('❌ Search results expired. Please search again.');
+      return;
+    }
+    
+    const ticketsToClose = searchResults.tickets;
+    await ctx.editMessageText(`🔄 Fetching agents...`);
+    
+    // Fetch available agents
+    let agents = [];
+    try {
+      agents = await freshdesk.getAgents();
+    } catch (error) {
+      logger.error('Error fetching agents:', error.message);
+      await ctx.editMessageText('❌ Error fetching agents. Please try again.');
+      return;
+    }
+    
+    if (agents.length === 0) {
+      await ctx.editMessageText('❌ No agents available. Cannot proceed with close.');
+      return;
+    }
+    
+    // Store the pending operation
+    userPendingCloseOps.set(userId, {
+      tickets: ticketsToClose,
+      keyword: searchResults.keyword,
+      agents: agents,
+      timestamp: Date.now()
+    });
+    
+    // Show agent selection
+    const agentButtons = agents.map(agent => 
+      [Markup.button.callback(`${agent.name}`, `select_agent_${userId}_${agent.id}`)]
+    );
+    
+    await ctx.editMessageText(
+      `👤 Select an agent to assign these ${ticketsToClose.length} ticket(s) to:\n\n${agents.map((a, i) => `${i+1}. ${a.name} (${a.email})`).join('\n')}`,
+      Markup.inlineKeyboard(agentButtons)
+    );
+    
+  } catch (error) {
+    logger.error('Closeall confirmation error:', error);
+    await ctx.editMessageText('❌ Error processing close request.');
+  }
+});
+
+bot.action(/closeall_cancel_(\d+)/, async (ctx) => {
+  try {
+    const userId = parseInt(ctx.match[1]);
+    await ctx.editMessageText('❌ Bulk close cancelled.');
+    logger.info(`User ${userId} cancelled bulk close operation`);
+  } catch (error) {
+    logger.error('Closeall cancel error:', error);
+  }
+});
+
+// Handle agent selection for bulk close
+bot.action(/^select_agent_(\d+)_(\d+)$/, async (ctx) => {
+  try {
+    const userId = parseInt(ctx.match[1]);
+    const agentId = parseInt(ctx.match[2]);
+    
+    const pendingOp = userPendingCloseOps.get(userId);
+    
+    if (!pendingOp) {
+      await ctx.answerCbQuery('❌ Operation expired. Please search again.');
+      return;
+    }
+
+    if (!pendingOp.tickets) {
+      await ctx.answerCbQuery('❌ This is not a bulk operation.');
+      return;
+    }
+    
+    const ticketsToClose = pendingOp.tickets;
+    const selectedAgent = pendingOp.agents.find(a => a.id === agentId);
+    
+    if (!selectedAgent) {
+      await ctx.answerCbQuery('❌ Agent not found.');
+      return;
+    }
+    
+    await ctx.editMessageText(`🔄 Closing ${ticketsToClose.length} ticket(s) and assigning to ${selectedAgent.name}...`);
+    
+    let closedCount = 0;
+    let failedCount = 0;
+    const failedTickets = [];
+    
+    // Close each ticket and assign to agent
+    for (const ticket of ticketsToClose) {
+      try {
+        await freshdesk.closeAndAssignTicket(ticket.id, agentId);
+        closedCount++;
+        logger.info(`Bulk close: Ticket #${ticket.id} closed and assigned to agent ${selectedAgent.name}`);
+      } catch (error) {
+        failedCount++;
+        failedTickets.push(`#${ticket.id}: ${error.message}`);
+        logger.error(`Bulk close error for ticket #${ticket.id}:`, error.message);
+      }
+    }
+    
+    // Send result summary
+    let resultMessage = `✅ Bulk Close Completed\n\n`;
+    resultMessage += `Successfully closed: ${closedCount}/${ticketsToClose.length}\n`;
+    resultMessage += `Assigned to: ${selectedAgent.name}\n`;
+    
+    if (failedCount > 0) {
+      resultMessage += `Failed: ${failedCount}\n\n`;
+      resultMessage += `Failed tickets:\n${failedTickets.join('\n')}`;
+    }
+
+    // Broadcast bulk close action
+    if (closedCount > 0) {
+      const closedIds = ticketsToClose.slice(0, closedCount).map(t => `#${t.id}`).join(', ');
+      await broadcastToUsers(bot, `📝 Action Log\n\nBulk Close: ${closedCount} ticket(s)\nAssigned to: ${selectedAgent.name}\nTickets: ${closedIds}\nBy: User ${userId}`, authorizedChats);
+    }
+    
+    await ctx.editMessageText(resultMessage);
+    
+    // Clear operations
+    userSearchResults.delete(userId);
+    userPendingCloseOps.delete(userId);
+    
+    logger.info(`User ${userId} completed bulk close: ${closedCount} closed to ${selectedAgent.name}, ${failedCount} failed`);
+  } catch (error) {
+    logger.error('Bulk agent selection error:', error);
+    await ctx.editMessageText('❌ Error closing tickets.');
+  }
+});
+
+// Handle agent selection for individual ticket close
+bot.action(/^close_ticket_select_agent_(\d+)_(\d+)$/, async (ctx) => {
+  try {
+    const userId = parseInt(ctx.match[1]);
+    const agentId = parseInt(ctx.match[2]);
+    
+    const pendingOp = userPendingCloseOps.get(userId);
+    
+    if (!pendingOp || !pendingOp.ticketId) {
+      await ctx.answerCbQuery('❌ Operation expired.');
+      return;
+    }
+    
+    const ticketId = pendingOp.ticketId;
+    const selectedAgent = pendingOp.agents.find(a => a.id === agentId);
+    
+    if (!selectedAgent) {
+      await ctx.answerCbQuery('❌ Agent not found.');
+      return;
+    }
+    
+    await ctx.editMessageText(`🔄 Closing ticket #${ticketId} and assigning to ${selectedAgent.name}...`);
+    
+    try {
+      await freshdesk.closeAndAssignTicket(ticketId, agentId);
+      
+      await ctx.editMessageText(
+        `✅ Ticket #${ticketId} closed and assigned to ${selectedAgent.name}`
+      );
+      
+      logger.info(`User ${userId} closed ticket #${ticketId} and assigned to agent ${selectedAgent.name}`);
+      await broadcastToUsers(bot, `📝 Action Log\n\nTicket #${ticketId}\nClosed and assigned to: ${selectedAgent.name}\nBy: User ${userId}`, authorizedChats);
+    } catch (error) {
+      await ctx.editMessageText(`❌ Error closing ticket: ${error.message}`);
+      logger.error(`Error closing ticket #${ticketId}:`, error.message);
+    }
+    
+    // Clear operation
+    userPendingCloseOps.delete(userId);
+  } catch (error) {
+    logger.error('Individual ticket close action error:', error);
+    await ctx.editMessageText('❌ Error closing ticket.');
   }
 });
 
@@ -314,10 +652,46 @@ bot.on('text', async (ctx) => {
     
     const status = text.split('status ')[1]?.trim();
     if (status) {
+      // If closing a ticket, require agent assignment
+      if (status.toLowerCase() === 'closed') {
+        try {
+          const agents = await freshdesk.getAgents();
+          
+          if (agents.length === 0) {
+            await ctx.reply('❌ No agents available. Cannot close ticket.');
+            return;
+          }
+          
+          // Store pending close operation
+          userPendingCloseOps.set(userId, {
+            ticketId: currentTicketId,
+            agents: agents,
+            timestamp: Date.now()
+          });
+          
+          // Show agent selection
+          const agentButtons = agents.map(agent =>
+            [Markup.button.callback(`${agent.name}`, `close_ticket_select_agent_${userId}_${agent.id}`)]
+          );
+          
+          await ctx.reply(
+            `👤 Select an agent to assign ticket #${currentTicketId} to when closing:\n\n${agents.map((a, i) => `${i+1}. ${a.name} (${a.email})`).join('\n')}`,
+            Markup.inlineKeyboard(agentButtons)
+          );
+          
+          logger.info(`User ${userId} initiated close for ticket #${currentTicketId}, awaiting agent selection`);
+        } catch (error) {
+          await ctx.reply(`❌ Error fetching agents: ${error.message}`);
+        }
+        return;
+      }
+      
+      // For other status updates (not close), just update directly
       try {
         await freshdesk.updateTicketStatus(currentTicketId, status);
         await ctx.reply(`✅ Ticket #${currentTicketId} status updated to "${status}"`);
         logger.info(`User ${userId} updated ticket #${currentTicketId} status to ${status}`);
+        await broadcastToUsers(bot, `📝 Action Log\n\nTicket #${currentTicketId}\nStatus changed to: ${status}\nBy: User ${userId}`, authorizedChats);
       } catch (error) {
         await ctx.reply(`❌ Error updating ticket status: ${error.message}`);
       }
@@ -338,6 +712,7 @@ bot.on('text', async (ctx) => {
         await freshdesk.updateTicketPriority(currentTicketId, priority);
         await ctx.reply(`✅ Ticket #${currentTicketId} priority updated to "${priority}"`);
         logger.info(`User ${userId} updated ticket #${currentTicketId} priority to ${priority}`);
+        await broadcastToUsers(bot, `📝 Action Log\n\nTicket #${currentTicketId}\nPriority changed to: ${priority}\nBy: User ${userId}`, authorizedChats);
       } catch (error) {
         await ctx.reply(`❌ Error updating priority: ${error.message}`);
       }
@@ -358,6 +733,7 @@ bot.on('text', async (ctx) => {
         await freshdesk.addTicketNote(currentTicketId, note, true);
         await ctx.reply(`✅ Note added to ticket #${currentTicketId}`);
         logger.info(`User ${userId} added note to ticket #${currentTicketId}`);
+        await broadcastToUsers(bot, `📝 Action Log\n\nTicket #${currentTicketId}\nNote added\nBy: User ${userId}`, authorizedChats);
       } catch (error) {
         await ctx.reply(`❌ Error adding note: ${error.message}`);
       }
@@ -378,6 +754,7 @@ bot.on('text', async (ctx) => {
         await freshdesk.addTicketReply(currentTicketId, comment);
         await ctx.reply(`✅ Comment added to ticket #${currentTicketId}`);
         logger.info(`User ${userId} added comment to ticket #${currentTicketId}`);
+        await broadcastToUsers(bot, `📝 Action Log\n\nTicket #${currentTicketId}\nComment added\nBy: User ${userId}`, authorizedChats);
       } catch (error) {
         await ctx.reply(`❌ Error adding comment: ${error.message}`);
       }
@@ -398,33 +775,72 @@ bot.on('text', async (ctx) => {
         
         // Store this ticket as the user's current ticket for updates
         userCurrentTicket.set(userId, ticketId);
-        
-        const ticketMessage = `
-📋 Ticket #${ticket.id}
 
-Subject: ${ticket.subject}
-Status: ${ticket.status}
-Priority: ${ticket.priority}
-Created: ${new Date(ticket.created_at).toLocaleString()}
+        const pe = priorityEmoji(ticket.priority);
+        const tags = ticket.tags.length > 0 ? ticket.tags.join(', ') : 'None';
+        const dueBy = ticket.due_by ? new Date(ticket.due_by).toLocaleString() : 'N/A';
+        const frDueBy = ticket.fr_due_by ? new Date(ticket.fr_due_by).toLocaleString() : 'N/A';
+        const desc = ticket.description ? ticket.description.substring(0, 500) + (ticket.description.length > 500 ? '...' : '') : 'No description';
 
-🔧 Update this ticket by replying with:
-• status open/pending/resolved/closed
-• priority low/medium/high/urgent
-• note Your note here
-• comment Your comment here
+        let ticketMessage = `${pe} <b>Ticket #${ticket.id}</b>\n\n`;
+        ticketMessage += `<b>Subject:</b> ${ticket.subject}\n`;
+        ticketMessage += `<b>Status:</b> ${ticket.status}\n`;
+        ticketMessage += `<b>Priority:</b> ${ticket.priority}\n`;
+        ticketMessage += `<b>Type:</b> ${ticket.type}\n`;
+        ticketMessage += `<b>Source:</b> ${ticket.source}\n`;
+        ticketMessage += `<b>Tags:</b> ${tags}\n\n`;
+        ticketMessage += `<b>Requester:</b> ${ticket.requester_name}\n`;
+        ticketMessage += `<b>Email:</b> ${ticket.requester_email}\n`;
+        ticketMessage += `<b>Phone:</b> ${ticket.requester_phone}\n\n`;
+        ticketMessage += `<b>Created:</b> ${new Date(ticket.created_at).toLocaleString()}\n`;
+        ticketMessage += `<b>Updated:</b> ${new Date(ticket.updated_at).toLocaleString()}\n`;
+        ticketMessage += `<b>Due by:</b> ${dueBy}\n`;
+        ticketMessage += `<b>First response due:</b> ${frDueBy}\n\n`;
+        ticketMessage += `<b>Description:</b>\n${desc}\n`;
 
-Examples:
-  status resolved
-  priority high
-  note Updated by bot
-        `;
-        
-        await ctx.reply(ticketMessage, Markup.keyboard([
-          ['status open', 'status pending'],
-          ['status resolved', 'status closed'],
-          ['priority low', 'priority high'],
-          ['Back to menu'],
-        ]).resize());
+        await ctx.reply(ticketMessage, { parse_mode: 'HTML' });
+
+        // Show conversations if any
+        if (ticket.conversations && ticket.conversations.length > 0) {
+          const convCount = ticket.conversations.length;
+          let convMessage = `\n💬 <b>Conversations (${convCount}):</b>\n\n`;
+          const messageLimit = 3800;
+          const convMessages = [];
+
+          ticket.conversations.forEach((conv, i) => {
+            const convDate = new Date(conv.created_at).toLocaleString();
+            const scope = conv.private ? '🔒 Private' : '🌐 Public';
+            const body = conv.body ? conv.body.substring(0, 300) + (conv.body.length > 300 ? '...' : '') : '(empty)';
+            const sender = conv.from_email || `User ${conv.user_id}`;
+            const convLine = `<b>${i+1}. ${scope}</b> — ${convDate}\nFrom: ${sender}\n${body}\n\n`;
+
+            if ((convMessage + convLine).length > messageLimit) {
+              convMessages.push(convMessage);
+              convMessage = `--- Conversations continued ---\n\n${convLine}`;
+            } else {
+              convMessage += convLine;
+            }
+          });
+
+          if (convMessage.length > 0) {
+            convMessages.push(convMessage);
+          }
+
+          for (const msg of convMessages) {
+            await ctx.reply(msg, { parse_mode: 'HTML' });
+          }
+        }
+
+        // Send update options
+        await ctx.reply(
+          `🔧 Update ticket #${ticket.id}:\n• status open/pending/resolved/closed\n• priority low/medium/high/urgent\n• note Your note here\n• comment Your comment here`,
+          Markup.keyboard([
+            ['status open', 'status pending'],
+            ['status resolved', 'status closed'],
+            ['priority low', 'priority high'],
+            ['Back to menu'],
+          ]).resize()
+        );
         
       } catch (error) {
         logger.error('Error fetching ticket:', error);
@@ -492,15 +908,34 @@ async function startBot() {
     await bot.launch();
     logger.info('🤖 Bot successfully launched');
 
+    // --- Periodic reconciliation: every 15 minutes ---
+    const RECONCILE_INTERVAL_MS = 15 * 60 * 1000;
+    // Run the first reconciliation shortly after startup (30 s)
+    const initialReconcileTimer = setTimeout(() => {
+      reconcileOpenTickets(freshdesk, bot, authorizedChats).catch(err =>
+        logger.error('Initial reconciliation error:', err)
+      );
+    }, 30_000);
+    const reconcileInterval = setInterval(() => {
+      reconcileOpenTickets(freshdesk, bot, authorizedChats).catch(err =>
+        logger.error('Periodic reconciliation error:', err)
+      );
+    }, RECONCILE_INTERVAL_MS);
+    logger.info(`⏱️  Periodic reconciliation scheduled every ${RECONCILE_INTERVAL_MS / 60000} minutes`);
+
     // Graceful shutdown
     process.once('SIGINT', () => {
       logger.info('SIGINT received, shutting down...');
+      clearTimeout(initialReconcileTimer);
+      clearInterval(reconcileInterval);
       server.close();
       bot.stop('SIGINT');
     });
 
     process.once('SIGTERM', () => {
       logger.info('SIGTERM received, shutting down...');
+      clearTimeout(initialReconcileTimer);
+      clearInterval(reconcileInterval);
       server.close();
       bot.stop('SIGTERM');
     });
