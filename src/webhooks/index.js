@@ -73,6 +73,19 @@ async function handleTicketCreated(event, bot, freshdesk, userSettings, loggerIn
     // Handle ticket correlation (DOWN/UP state matching)
     await correlation.handleNewTicket(ticket, freshdesk, bot, authorizedChats);
 
+    // Check if this ticket should be merged with an existing related ticket
+    let mergeNotification = '';
+    try {
+      const mergeResult = await freshdesk.mergeRelatedTickets(ticketId, ticket.subject);
+      if (mergeResult) {
+        mergeNotification = `\n🔗 AUTO-MERGED: Linked with related ticket #${mergeResult.mergedTicketId} (Device: ${mergeResult.deviceName}, Previous status: ${mergeResult.previousStatus})`;
+        logger.info(`Merged ticket #${ticketId} with #${mergeResult.mergedTicketId}. Device: ${mergeResult.deviceName}`);
+      }
+    } catch (mergeError) {
+      // Merge is non-critical, don't fail the whole operation
+      logger.warn(`Merge check failed for ticket #${ticketId}:`, mergeError.message);
+    }
+
     const message = `
 📌 New Ticket Created
 
@@ -80,7 +93,7 @@ async function handleTicketCreated(event, bot, freshdesk, userSettings, loggerIn
 Priority: ${getPriorityEmoji(ticket.priority)} ${ticket.priority}
 Status: ${ticket.status}
 Customer: ${ticket.customer_email}
-Created: ${new Date(ticket.created_at).toLocaleString()}
+Created: ${new Date(ticket.created_at).toLocaleString()}${mergeNotification}
     `;
 
     await broadcastToUsers(bot, message, userSettings, authorizedChats, loggerInstance);
