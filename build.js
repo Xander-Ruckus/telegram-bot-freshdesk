@@ -22,6 +22,7 @@ const BUNDLE_PATH = join(DIST_DIR, 'bot.bundle.cjs');
 const MONITOR_BUNDLE = join(DIST_DIR, 'monitor.bundle.cjs');
 const EXE_NAME = 'telegram-bot-freshdesk.exe';
 const MONITOR_EXE = 'service-monitor.exe';
+const SERVICE_EXE = 'TelFreshBotService.exe';
 
 function ensureDir(dir) {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
@@ -38,6 +39,10 @@ function copyDirRecursive(src, dest) {
       copyFileSync(srcPath, destPath);
     }
   }
+}
+
+function findFirstExistingPath(paths) {
+  return paths.find(path => existsSync(path));
 }
 
 console.log('=== Telegram Bot Freshdesk - Build ===\n');
@@ -93,6 +98,30 @@ try {
   console.log(`   ✅ Monitor exe created: dist/${MONITOR_EXE}`);
 } catch (err) {
   console.error('❌ pkg monitor compile failed:', err.message);
+  process.exit(1);
+}
+
+// Step 2b: Compile Windows service host
+console.log('\n🛠️  Compiling Windows service host...');
+
+const cscPath = findFirstExistingPath([
+  'C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe',
+  'C:\\Windows\\Microsoft.NET\\Framework\\v4.0.30319\\csc.exe',
+]);
+
+if (!cscPath) {
+  console.error('❌ C# compiler not found. Cannot build TelFreshBotService.exe');
+  process.exit(1);
+}
+
+try {
+  execSync(
+    `"${cscPath}" /nologo /target:exe /out:"dist\\${SERVICE_EXE}" /reference:System.ServiceProcess.dll "windows-service\\TelFreshBotService.cs"`,
+    { stdio: 'inherit', cwd: __dirname }
+  );
+  console.log(`   ✅ Windows service host created: dist/${SERVICE_EXE}`);
+} catch (err) {
+  console.error('❌ Service host compile failed:', err.message);
   process.exit(1);
 }
 
@@ -200,12 +229,30 @@ echo  Telegram Bot - Freshdesk
 echo  Starting All Services...
 echo ====================================
 echo.
-start "Telegram Bot" "%~dp0${EXE_NAME}"
-timeout /t 3 /nobreak > nul
 start "Service Monitor" "%~dp0${MONITOR_EXE}"
 echo.
-echo Services started. You can close this window.
+echo Service monitor started. It will launch and supervise the bot.
 timeout /t 3
+`);
+
+writeFileSync(join(DIST_DIR, 'install-service.bat'), `@echo off
+sc.exe create "Tel-Fresh-Bot" binPath= "\"%~dp0${SERVICE_EXE}\"" start= auto DisplayName= "Tel-Fresh-Bot"
+sc.exe description "Tel-Fresh-Bot" "Telegram Freshdesk bot service"
+sc.exe failure "Tel-Fresh-Bot" reset= 86400 actions= restart/5000/restart/5000/restart/5000
+sc.exe start "Tel-Fresh-Bot"
+`);
+
+writeFileSync(join(DIST_DIR, 'start-service.bat'), `@echo off
+sc.exe start "Tel-Fresh-Bot"
+`);
+
+writeFileSync(join(DIST_DIR, 'stop-service.bat'), `@echo off
+sc.exe stop "Tel-Fresh-Bot"
+`);
+
+writeFileSync(join(DIST_DIR, 'remove-service.bat'), `@echo off
+sc.exe stop "Tel-Fresh-Bot"
+sc.exe delete "Tel-Fresh-Bot"
 `);
 
 console.log('   ✅ Launcher scripts created');
@@ -217,6 +264,7 @@ console.log('====================================');
 console.log(`\nOutput directory: dist/`);
 console.log(`  ${EXE_NAME}       - Main bot executable`);
 console.log(`  ${MONITOR_EXE}         - Service monitor executable`);
+console.log(`  ${SERVICE_EXE}      - Windows service host`);
 console.log(`  start-bot.bat          - Launch the bot`);
 console.log(`  start-monitor.bat      - Launch the monitor`);
 console.log(`  start-all.bat          - Launch both services`);
