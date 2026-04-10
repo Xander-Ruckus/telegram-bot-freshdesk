@@ -11,6 +11,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HEALTH_CHECK_INTERVAL = 15 * 60 * 1000; // 15 minutes
 const HEALTH_CHECK_TIMEOUT = 5000; // 5 seconds timeout
 const HEALTH_CHECK_URL = 'http://localhost:3001/webhook/health';
+const isPackaged = typeof process.pkg !== 'undefined';
+const runtimeDir = isPackaged ? path.dirname(process.execPath) : __dirname;
 
 let botProcess = null;
 let lastHealthCheck = null;
@@ -23,9 +25,14 @@ let restartCount = 0;
 function startBot() {
   return new Promise((resolve) => {
     logger.info('🚀 Starting bot process...');
+
+    const command = isPackaged
+      ? path.join(runtimeDir, 'telegram-bot-freshdesk.exe')
+      : 'node';
+    const args = isPackaged ? [] : ['src/bot.js'];
     
-    botProcess = spawn('node', ['src/bot.js'], {
-      cwd: __dirname,
+    botProcess = spawn(command, args, {
+      cwd: runtimeDir,
       stdio: 'inherit',
       detached: false
     });
