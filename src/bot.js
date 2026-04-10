@@ -88,6 +88,7 @@ Use /help to see all available commands.
   await ctx.reply(welcomeMessage, Markup.keyboard([
     ['/help', '/settings'],
     ['/status', '/tickets'],
+    ['/consolidate'],
   ]).resize());
   
   logger.info(`✅ User ${userId} (Chat ${chatId}) started bot and registered for notifications`);
@@ -104,6 +105,7 @@ bot.command('help', async (ctx) => {
 /open - Show only OPEN/PENDING tickets
 /search <keyword> - Find open tickets by keyword
 /closeall "<keyword>" - Close all tickets matching keyword
+/consolidate - Consolidate DOWN/UP ticket pairs
 /agents - List active agents
 /test - Send test notification
 
@@ -338,6 +340,31 @@ bot.command('agents', async (ctx) => {
   } catch (error) {
     logger.error('Agents fetch error:', error);
     await ctx.reply('❌ Error fetching agents. Please try again later.');
+  }
+});
+
+bot.command('consolidate', async (ctx) => {
+  try {
+    await ctx.reply('🔄 Starting DOWN/UP ticket consolidation...\nThis will scan all open tickets for matching DOWN↔UP pairs and close them.');
+
+    const results = await reconcileOpenTickets(freshdesk, bot, authorizedChats);
+
+    let summary = '✅ Consolidation complete!\n\n';
+    if (results && results.totalClosed > 0) {
+      summary += `Closed ${results.totalClosed} DOWN ticket(s).\n`;
+      if (results.closedPairs && results.closedPairs.length > 0) {
+        results.closedPairs.forEach(pair => {
+          summary += `  🔻 DOWN #${pair.down} ↔ 🔺 UP #${pair.up}\n`;
+        });
+      }
+    } else {
+      summary += 'No matching DOWN/UP ticket pairs found to consolidate.\nStandalone UP ticket closures are broadcast separately.';
+    }
+
+    await ctx.reply(summary);
+  } catch (error) {
+    logger.error('Consolidation error:', error);
+    await ctx.reply(`❌ Error during consolidation: ${error.message}`);
   }
 });
 
@@ -866,7 +893,7 @@ bot.on('text', async (ctx) => {
     return ctx.reply('🏠 Main Menu', Markup.keyboard([
       ['/help', '/status'],
       ['/tickets', '/open'],
-      ['/agents'],
+      ['/consolidate', '/agents'],
     ]).resize());
   }
 
